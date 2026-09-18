@@ -24,3 +24,5 @@ if [[ "$RESET_RESULT" != "Reset logic self-test passed" ]]; then
   exit 1
 fi
 echo "$RESET_RESULT"
+
+/bin/bash "$ROOT_DIR/Scripts/safety-check.sh"

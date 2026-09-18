@@ -2134,13 +2134,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
             rebuildMenu()
         }
         DispatchQueue.global(qos: .utility).async {
-            var result = self.runCodexAuth(force ? ["list", "--debug"] : ["list"])
+            var result = self.runCodexAuth(["list", "--json"])
             var usedSkipAPI = false
             if result.status != 0 {
-                result = self.runCodexAuth(["list", "--skip-api"])
+                result = self.runCodexAuth(["list"])
+            }
+            if result.status != 0 {
+                result = self.runCodexAuth(["list", "--json", "--skip-api"])
+                if result.status != 0 {
+                    result = self.runCodexAuth(["list", "--skip-api"])
+                }
                 usedSkipAPI = result.status == 0
             }
-            let parsed = result.status == 0 ? self.parseAccounts(result.output, usageIsLive: !usedSkipAPI) : []
+            let parsed = result.status == 0 ? self.parseAccountOutput(result.output, usageIsLive: !usedSkipAPI) : []
             let completedResult = result
             Task {
                 async let resetTask = self.fetchResetCreditsForRefresh(
@@ -5102,23 +5108,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
 
     private func restartCodexApp() -> CommandResult {
         var transcript: [String] = []
-        transcript.append("Quitting \(codexDesktopAppName) process tree...")
+        transcript.append("Requesting a graceful quit from \(codexDesktopAppName)...")
 
-        for attempt in 1...6 {
-            let pids = codexAppPIDs()
-            if pids.isEmpty { break }
-            let signal = attempt == 1 ? "-TERM" : "-KILL"
-            _ = run("/bin/kill", [signal] + pids)
-            Thread.sleep(forTimeInterval: 1)
+        let runningApplications = NSWorkspace.shared.runningApplications.filter(isCodexDesktopApplication)
+        for application in runningApplications {
+            let label = application.localizedName ?? codexDesktopAppName
+            if application.terminate() {
+                transcript.append("Graceful quit requested for \(label).")
+            } else {
+                transcript.append("Graceful quit could not be requested for \(label).")
+            }
+        }
+
+        let deadline = Date().addingTimeInterval(20)
+        while Date() < deadline {
+            if codexAppPIDs().isEmpty {
+                break
+            }
+            Thread.sleep(forTimeInterval: 0.2)
         }
 
         let remaining = codexAppPIDs()
-        if !remaining.isEmpty {
-            transcript.append("Codex helper processes remained after force quit: \(remaining.joined(separator: ", ")). Opening Codex anyway.")
-        }
-
-        if let configMessage = ensureComputerUsePluginConfigured() {
-            transcript.append(configMessage)
+        guard remaining.isEmpty else {
+            transcript.append("Codex did not exit gracefully; no force kill was attempted.")
+            transcript.append("Remaining Codex process IDs: \(remaining.joined(separator: ", ")).")
+            return CommandResult(status: 1, output: transcript.joined(separator: "\n"))
         }
 
         transcript.append("Opening \(codexDesktopAppName)...")
@@ -5139,66 +5153,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         }
 
         return CommandResult(status: 0, output: transcript.joined(separator: "\n"))
-    }
-
-    private func ensureComputerUsePluginConfigured() -> String? {
-        let home = NSHomeDirectory()
-        let configURL = URL(fileURLWithPath: "\(home)/.codex/config.toml")
-        let stateURL = URL(fileURLWithPath: "\(home)/.codex/.codex-global-state.json")
-        var changed = false
-
-        do {
-            var config = try String(contentsOf: configURL, encoding: .utf8)
-            if !config.contains("[plugins.\"computer-use@openai-bundled\"]") {
-                let chromeBlock = "[plugins.\"chrome@openai-bundled\"]\nenabled = true"
-                let computerUseBlock = "\(chromeBlock)\n\n[plugins.\"computer-use@openai-bundled\"]\nenabled = true"
-                if config.contains(chromeBlock) {
-                    config = config.replacingOccurrences(of: chromeBlock, with: computerUseBlock)
-                } else {
-                    config += "\n\n[plugins.\"computer-use@openai-bundled\"]\nenabled = true\n"
-                }
-                changed = true
-            }
-
-            if let computerUseApp = ComputerUsePluginLocator.latestApp(homeDirectory: home) {
-                let codePathLine = "CODEX_CLI_PATH = \"\(codexDesktopResourcesPath)/codex\""
-                let servicePathLine = "SKY_CUA_SERVICE_PATH = \"\(computerUseApp.path)\""
-                let pattern = #"(?m)^SKY_CUA_SERVICE_PATH = ".*"$"#
-                if let regex = try? NSRegularExpression(pattern: pattern),
-                   let match = regex.firstMatch(in: config, range: NSRange(config.startIndex..., in: config)),
-                   let range = Range(match.range, in: config) {
-                    if config[range] != servicePathLine {
-                        config.replaceSubrange(range, with: servicePathLine)
-                        changed = true
-                    }
-                } else if config.contains(codePathLine) {
-                    config = config.replacingOccurrences(of: codePathLine, with: "\(servicePathLine)\n\(codePathLine)")
-                    changed = true
-                }
-            }
-
-            if changed {
-                try config.write(to: configURL, atomically: true, encoding: .utf8)
-            }
-        } catch {
-            return "Computer Use config check failed: \(error.localizedDescription)"
-        }
-
-        do {
-            var state = try String(contentsOf: stateURL, encoding: .utf8)
-            if state.contains("\"electron-chrome-extension-sync-managed-plugin-ids\":[\"chrome@openai-bundled\"]") {
-                state = state.replacingOccurrences(
-                    of: "\"electron-chrome-extension-sync-managed-plugin-ids\":[\"chrome@openai-bundled\"]",
-                    with: "\"electron-chrome-extension-sync-managed-plugin-ids\":[\"chrome@openai-bundled\",\"computer-use@openai-bundled\"]"
-                )
-                try state.write(to: stateURL, atomically: true, encoding: .utf8)
-                changed = true
-            }
-        } catch {
-            return "Computer Use state check failed: \(error.localizedDescription)"
-        }
-
-        return changed ? "Repaired Computer Use plugin config before Codex launch." : nil
     }
 
     private func codexAppPIDs() -> [String] {
@@ -5244,6 +5198,98 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
                 isActive: isActive
             )
         }
+    }
+
+    private func parseAccountOutput(_ output: String, usageIsLive: Bool) -> [CodexAccount] {
+        guard
+            let data = output.data(using: .utf8),
+            let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+            root["accounts"] as? [[String: Any]] != nil
+        else {
+            return parseAccounts(output, usageIsLive: usageIsLive)
+        }
+        return parseJSONAccounts(root, usageIsLive: usageIsLive)
+    }
+
+    private func parseJSONAccounts(_ root: [String: Any], usageIsLive: Bool) -> [CodexAccount] {
+        guard let rawAccounts = root["accounts"] as? [[String: Any]] else { return [] }
+
+        return rawAccounts.compactMap { rawAccount in
+            guard
+                let number = integerValue(rawAccount["number"]),
+                let email = rawAccount["email"] as? String,
+                !email.isEmpty
+            else {
+                return nil
+            }
+
+            let usage = rawAccount["usage"] as? [String: Any]
+            let primary = parseJSONUsageWindow(usage?["primary"])
+            let secondary = parseJSONUsageWindow(usage?["secondary"])
+            let fullWindow = UsageLimitWindowSnapshot(remainingPercent: 100, resetAt: nil)
+            let fiveHourWindow: UsageLimitWindowSnapshot
+            let weeklyWindow: UsageLimitWindowSnapshot
+
+            if let primary, let secondary {
+                if let primaryDuration = primary.duration, let secondaryDuration = secondary.duration,
+                   primaryDuration <= secondaryDuration {
+                    fiveHourWindow = primary.snapshot
+                    weeklyWindow = secondary.snapshot
+                } else {
+                    fiveHourWindow = secondary.snapshot
+                    weeklyWindow = primary.snapshot
+                }
+            } else if let only = primary ?? secondary {
+                if let duration = only.duration, duration >= 86_400 {
+                    fiveHourWindow = fullWindow
+                    weeklyWindow = only.snapshot
+                } else {
+                    fiveHourWindow = only.snapshot
+                    weeklyWindow = fullWindow
+                }
+            } else {
+                fiveHourWindow = fullWindow
+                weeklyWindow = fullWindow
+            }
+
+            let fiveHourUsage = usageIsLive ? directUsageText(fiveHourWindow, weekly: false) : "-"
+            let weeklyUsage = usageIsLive ? directUsageText(weeklyWindow, weekly: true) : "-"
+            let plan = (rawAccount["plan"] as? String ?? "-").lowercased()
+            let isActive = rawAccount["active"] as? Bool ?? false
+
+            return CodexAccount(
+                selector: String(format: "%02d", number),
+                email: email,
+                plan: plan,
+                fiveHourUsage: fiveHourUsage,
+                weeklyUsage: weeklyUsage,
+                fiveHourUsedPercent: usageIsLive ? 100 - fiveHourWindow.remainingPercent : nil,
+                weeklyUsedPercent: usageIsLive ? 100 - weeklyWindow.remainingPercent : nil,
+                lastActivity: "-",
+                isActive: isActive
+            )
+        }
+    }
+
+    private func parseJSONUsageWindow(_ raw: Any?) -> (snapshot: UsageLimitWindowSnapshot, duration: Int?)? {
+        guard
+            let window = raw as? [String: Any],
+            let usedPercent = integerValue(window["used_percent"])
+        else {
+            return nil
+        }
+
+        let resetAt = integerValue(window["resets_at"]).map {
+            Date(timeIntervalSince1970: TimeInterval($0))
+        }
+        let duration = integerValue(window["window_minutes"]).map { $0 * 60 }
+        return (
+            UsageLimitWindowSnapshot(
+                remainingPercent: max(0, min(100, 100 - usedPercent)),
+                resetAt: resetAt
+            ),
+            duration
+        )
     }
 
     private func demoAccounts() -> [CodexAccount] {
@@ -5510,6 +5556,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     }
 
     private func resetLogicSelfTest() -> String {
+        let accountJSONFixture: [String: Any] = [
+            "accounts": [[
+                "number": 1,
+                "email": "dev+1@juner.ai",
+                "alias": "cdx1",
+                "plan": "pro",
+                "active": true,
+                "usage": [
+                    "primary": [
+                        "used_percent": 46,
+                        "window_minutes": 10_080,
+                        "resets_at": 1_800_604_800
+                    ],
+                    "secondary": NSNull()
+                ]
+            ]]
+        ]
+        guard
+            let accountJSONData = try? JSONSerialization.data(withJSONObject: accountJSONFixture),
+            let accountJSONOutput = String(data: accountJSONData, encoding: .utf8),
+            let parsedAccount = parseAccountOutput(accountJSONOutput, usageIsLive: true).first,
+            parsedAccount.email == "dev+1@juner.ai",
+            parsedAccount.weeklyUsedPercent == 46
+        else {
+            return "Reset logic self-test FAILED: account JSON usage conversion"
+        }
+
         let usageFixture: [String: Any] = [
             "rate_limit": [
                 "primary_window": ["used_percent": 1, "limit_window_seconds": 18_000, "reset_at": 1_800_000_000],

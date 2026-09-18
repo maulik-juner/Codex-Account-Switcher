@@ -152,6 +152,7 @@ enum ComputerUsePluginLocator {
     }
 }
 
+
 enum AuthBackupPruner {
     @discardableResult
     static func prune(in directory: URL, keepingPerAccount keepCount: Int = 10, fileManager: FileManager = .default) -> Int {
